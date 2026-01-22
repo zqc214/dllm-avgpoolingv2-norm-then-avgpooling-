@@ -1696,3 +1696,4 @@ class LLaDAModelLM(PreTrainedModel):
 
 # Register the model so that it is available for transformer pipelines, auto-loading, etc.
 AutoModel.register(LLaDAConfig, LLaDAModelLM)
+
