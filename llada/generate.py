@@ -93,35 +93,54 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 
 def get_keep_indices_by_avgpool(key_states, keep_ratio, kernel_size=3):
     """
-    对给定的 Key 片段进行 AvgPool 打分并返回保留索引。
+    [修改版] 先 Norm 再 AvgPool 的筛选策略。
     key_states: (Batch, Num_Heads, Seq_Len, Head_Dim)
     """
     if key_states.shape[2] == 0:
         return torch.empty(key_states.shape[0], 0, device=key_states.device, dtype=torch.long)
 
-    # 1. 预处理：聚合多头，转为 (B, D, L) 以适配 AvgPool
-    # 我们认为一个 Token 所有头的平均能量代表其重要性
-    # (B, H, L, D) -> mean(1) -> (B, L, D) -> permute -> (B, D, L)
-    x = key_states.mean(dim=1).permute(0, 2, 1) 
-    
-    # 2. 平均池化 (Stride=1, Padding保持长度不变)
+    # 1. 预处理：聚合多头 (B, H, L, D) -> (B, L, D)
+    # 我们可以先对 Head 维度取平均，或者也可以先算每个 Head 的 Norm 再平均
+    # 这里保持和你原逻辑一致：先融合多头特征
+    x = key_states.mean(dim=1) # (B, L, D)
+
+    # --- [核心修改开始] ---
+
+    # 2. 先计算能量 (L2 Norm)
+    # 此时 x 还是原始的 Key 向量，包含了 RoPE 旋转
+    # 但 Norm 操作是旋转不变的，所以这一步完美提取了每个 Token 的“纯粹力度”
+    # energy shape: (B, L)
+    energy = torch.norm(x, p=2, dim=-1)
+
+    # 3. 再进行平均池化 (平滑能量包络)
+    # energy 需要扩展维度才能进 avg_pool1d: (B, L) -> (B, 1, L)
+    energy = energy.unsqueeze(1)
+
     pad = kernel_size // 2
-    # x_low即为低频信号
-    x_low = F.avg_pool1d(x, kernel_size=kernel_size, stride=1, padding=pad, count_include_pad=False)
     
-    # 3. 计算低频能量 (L2 Norm) -> (B, L)
-    # 还原维度 (B, D, L) -> (B, L, D)
-    x_low = x_low.permute(0, 2, 1)
-    scores = torch.norm(x_low, p=2, dim=-1)
+    # 对能量曲线进行低通滤波
+    # 这会平滑掉那些孤立的噪声峰值，保留连续的高能量区域
+    # output shape: (B, 1, L)
+    smoothed_energy = F.avg_pool1d(
+        energy, 
+        kernel_size=kernel_size, 
+        stride=1, 
+        padding=pad, 
+        count_include_pad=False
+    )
     
-    # 4. Top-K 筛选
+    # 还原形状: (B, 1, L) -> (B, L)
+    scores = smoothed_energy.squeeze(1)
+
+    # --- [核心修改结束] ---
+    
+    # 4. Top-K 筛选 (保持不变)
     L = key_states.shape[2]
-    k_keep = max(1, int(L * keep_ratio)) # 至少保留1个，防止报错
+    k_keep = max(1, int(L * keep_ratio))
     
     _, indices = torch.topk(scores, k=k_keep, dim=1)
     
-    # 5. 必须排序！
-    # 因为 Key 已经包含了 RoPE 信息，乱序会破坏相对位置编码的有效性
+    # 5. 必须排序
     indices, _ = torch.sort(indices, dim=1)
     
     return indices
