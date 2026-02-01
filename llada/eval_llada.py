@@ -67,6 +67,10 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        prefix_keep_ratio=0.5,
+        suffix_keep_ratio=0.5,
+        keep_first_n=0,
+        keep_last_n=0,
         **kwargs,
     ):
         '''
@@ -132,6 +136,10 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.prefix_keep_ratio = prefix_keep_ratio
+        self.suffix_keep_ratio = suffix_keep_ratio
+        self.keep_first_n = keep_first_n
+        self.keep_last_n = keep_last_n
     @property
     def rank(self):
         return self._rank
@@ -339,7 +347,9 @@ class LLaDAEvalHarness(LM):
             if self.use_cache:
                 if self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                        prefix_keep_ratio=self.prefix_keep_ratio, suffix_keep_ratio=self.suffix_keep_ratio,
+                                        keep_first_n=self.keep_first_n, keep_last_n=self.keep_last_n)
                 else:
                     generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)

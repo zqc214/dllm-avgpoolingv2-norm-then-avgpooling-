@@ -147,9 +147,15 @@ def get_keep_indices_by_avgpool(key_states, keep_ratio, kernel_size=3):
 
 # llada/generate.py
 
-def prune_dual_kv_cache(past_key_values, current_start, current_end, prefix_ratio=0.5, suffix_ratio=0.5):
+def prune_dual_kv_cache(past_key_values, current_start, current_end, prefix_ratio=0.5, suffix_ratio=0.5,
+                        keep_first_n=0, keep_last_n=0, prompt_length=0):
     """
     对 Dual Cache 进行分区剪枝，并剔除 Current Block。
+    
+    Args:
+        keep_first_n: 保留 prompt 的前 N 个 token（不参与剪枝）
+        keep_last_n: 保留当前 block 前一个 block 的最后 N 个 token（不参与剪枝）
+        prompt_length: prompt 的长度
     """
     layer_idx = len(past_key_values) // 2
     sample_key = past_key_values[layer_idx][0] # (B, H, Total_Len, D)
@@ -161,31 +167,117 @@ def prune_dual_kv_cache(past_key_values, current_start, current_end, prefix_rati
     prefix_keys = sample_key[:, :, :current_start, :]
     suffix_keys = sample_key[:, :, current_end:, :]
     
-    # 分别计算保留索引
+    # ============================================================
+    # [新增] 确定需要保护的 token 范围
+    # ============================================================
+    # 1. Prompt 的前 N 个 token（全局坐标）
+    protected_first_start = 0
+    protected_first_end = min(keep_first_n, prompt_length)
+    
+    # 2. Current block 前面的最后 N 个 token（全局坐标）
+    #    - 如果是第一个 block，这部分就是 prompt 的最后 N 个
+    #    - 否则是前一个 block 的最后 N 个
+    protected_last_start = max(0, current_start - keep_last_n)
+    protected_last_end = current_start
+    
+    # 生成保护的索引（全局坐标）
+    protected_indices_list = []
+    
+    # 添加前 N 个 token
+    if protected_first_end > protected_first_start:
+        first_n_indices = torch.arange(protected_first_start, protected_first_end, device=device).unsqueeze(0).expand(B, -1)
+        protected_indices_list.append(first_n_indices)
+    
+    # 添加最后 N 个 token（在 current block 之前）
+    if protected_last_end > protected_last_start:
+        last_n_indices = torch.arange(protected_last_start, protected_last_end, device=device).unsqueeze(0).expand(B, -1)
+        protected_indices_list.append(last_n_indices)
+    
+    # ============================================================
+    # [修改] 对 prefix 和 suffix 分别进行剪枝（排除保护的 token）
+    # ============================================================
+    
+    # 分别计算保留索引（这些函数会在所有 token 上计算能量，包括保护的）
     prefix_indices = get_keep_indices_by_avgpool(prefix_keys, prefix_ratio) 
     suffix_indices = get_keep_indices_by_avgpool(suffix_keys, suffix_ratio)
     
     # 加上偏移量，转换成全局坐标
     suffix_indices = suffix_indices + current_end 
     
-    # --- [关键修改] 移除 Current Block 的索引 ---
-    # 我们不再生成 current_indices，也不将其拼接到 global_indices 中
+    # ============================================================
+    # [新增] 将保护的索引添加到最终的保留列表中
+    # ============================================================
+    indices_to_keep = []
     
-    # Final = [Keep_Prefix, Keep_Suffix]
-    global_indices = torch.cat([prefix_indices, suffix_indices], dim=1)
+    # 1. 添加保护的 token
+    if protected_indices_list:
+        indices_to_keep.extend(protected_indices_list)
     
-    # 排序确保有序
-    global_indices, _ = torch.sort(global_indices, dim=1)
+    # 2. 添加剪枝后保留的 prefix token
+    if prefix_indices.shape[1] > 0:
+        indices_to_keep.append(prefix_indices)
     
-    # 执行物理剪枝
+    # 3. 添加剪枝后保留的 suffix token
+    if suffix_indices.shape[1] > 0:
+        indices_to_keep.append(suffix_indices)
+    
+    # 合并所有保留的索引
+    if indices_to_keep:
+        global_indices = torch.cat(indices_to_keep, dim=1)
+        
+        # 去重（因为保护的 token 可能与剪枝保留的重复）并排序
+        # 使用 unique 来去重
+        global_indices_list = []
+        for b in range(B):
+            unique_indices = torch.unique(global_indices[b])
+            # 排序
+            unique_indices, _ = torch.sort(unique_indices)
+            global_indices_list.append(unique_indices)
+        
+        # 找到最大长度，进行 padding（用 -1 标记）
+        max_len = max(idx.shape[0] for idx in global_indices_list)
+        global_indices = torch.full((B, max_len), -1, dtype=torch.long, device=device)
+        for b in range(B):
+            global_indices[b, :global_indices_list[b].shape[0]] = global_indices_list[b]
+    else:
+        # 如果没有任何保留的 token，返回空
+        global_indices = torch.empty((B, 0), dtype=torch.long, device=device)
+    
+    # ============================================================
+    # 执行物理剪枝（处理 padding）
+    # ============================================================
     new_past_key_values = []
-    gather_idx = global_indices.unsqueeze(1).unsqueeze(-1).expand(B, H, global_indices.shape[1], D)
     
-    for layer in past_key_values:
-        k, v = layer 
-        k_pruned = torch.gather(k, 2, gather_idx)
-        v_pruned = torch.gather(v, 2, gather_idx)
-        new_past_key_values.append((k_pruned, v_pruned))
+    if global_indices.shape[1] > 0:
+        # 创建有效 mask（-1 表示 padding）
+        valid_mask = global_indices >= 0  # (B, max_len)
+        
+        # 为每个 batch 单独处理
+        batch_results = []
+        for b in range(B):
+            valid_idx = global_indices[b][valid_mask[b]]  # 去除 padding
+            batch_results.append(valid_idx)
+        
+        # 再次找到最大长度并 padding
+        max_valid_len = max(idx.shape[0] for idx in batch_results)
+        padded_indices = torch.zeros((B, max_valid_len), dtype=torch.long, device=device)
+        for b in range(B):
+            padded_indices[b, :batch_results[b].shape[0]] = batch_results[b]
+        
+        gather_idx = padded_indices.unsqueeze(1).unsqueeze(-1).expand(B, H, max_valid_len, D)
+        
+        for layer in past_key_values:
+            k, v = layer 
+            k_pruned = torch.gather(k, 2, gather_idx)
+            v_pruned = torch.gather(v, 2, gather_idx)
+            new_past_key_values.append((k_pruned, v_pruned))
+    else:
+        # 空的情况
+        for layer in past_key_values:
+            k, v = layer
+            k_empty = torch.empty((B, H, 0, D), dtype=k.dtype, device=device)
+            v_empty = torch.empty((B, H, 0, D), dtype=v.dtype, device=device)
+            new_past_key_values.append((k_empty, v_empty))
         
     return tuple(new_past_key_values)
 
@@ -324,8 +416,14 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
-    prefix_keep_ratio=0.5, suffix_keep_ratio=0.5
+    prefix_keep_ratio=0.5, suffix_keep_ratio=0.5,
+    keep_first_n=0, keep_last_n=0
 ):
+    """
+    Args:
+        keep_first_n: 保留 prompt 的前 N 个 token（不参与剪枝）
+        keep_last_n: 保留当前 block 前面最近的 N 个 token（不参与剪枝）
+    """
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
     assert gen_length % block_length == 0
@@ -394,7 +492,10 @@ def generate_with_dual_cache(
                 current_start=s, 
                 current_end=e, 
                 prefix_ratio=prefix_keep_ratio, 
-                suffix_ratio=suffix_keep_ratio
+                suffix_ratio=suffix_keep_ratio,
+                keep_first_n=keep_first_n,
+                keep_last_n=keep_last_n,
+                prompt_length=Lp
             )
 
             t1.record() # 结束计时
